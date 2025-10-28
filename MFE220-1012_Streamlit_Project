@@ -1,0 +1,453 @@
+import streamlit as st
+import pandas as pd
+# import numpy as np # No longer explicitly needed, Pandas handles NaN
+import altair as alt
+import plotly.figure_factory as ff
+# import datetime # No longer needed
+
+# --- 1. Page Configuration ---
+st.set_page_config(
+    page_title="Excel Dashboard Viewer",
+    page_icon="📊",
+    layout="wide"
+)
+
+# --- 2. Title and Description ---
+st.title("Excel to Dashboard Viewer 📊")
+st.write("Upload an Excel file to see the task status for each department.")
+
+# --- 3. Data Mapping (USER MUST EDIT THIS) ---
+COLUMN_MAPPINGS = {
+    # --- General Keys ---
+    "common_key": "Assy", # For merging AND drilldown category
+
+    # --- Donut Chart keys (From Prog_Export) ---
+    "resourceId": "Department Owner",
+    "status": "Task Status",
+
+    # --- Gantt Chart keys (From Prog_Export) ---
+    "gantt_task": "Task Name",
+    "gantt_start": "Start Date",
+    "gantt_end": "Finish Date",
+    "gantt_wbs": "WBS",
+
+    # --- Milestone key (From Prog_Export) ---
+    "milestone": "Milestone",
+
+    # --- Dept Completion % key (From Prog_Export) ---
+    "percent_complete": "% Complete", # Used for Dept Avg table
+
+    # --- Blocked Task key (From Prog_Export) ---
+    "blocked_status": "Blocked",
+
+    # --- Drill-Down Donut status key (From Dash_Export) ---
+    "drilldown_status": "Installed Mechanically", # Status for drilldown donuts
+    "in_stock_status": "In Stock", # Keeping this in case needed elsewhere
+
+    # --- Assy Avg % keys (From Assy_Prog sheet) ---
+    "assy_num": "Assy", # Change if Assy number column has a different name in Assy_Prog
+    "assy_percent": "Assy % Complete" # Change to match the % column name in Assy_Prog
+}
+
+# --- 4. Status/Value Definitions (USER MUST EDIT THIS) ---
+STATUS_COMPLETE_VALUE = "Complete"
+MILESTONE_VALUE = "Yes"
+BLOCKED_VALUE = "Blocked" # Change if your value is different
+# Define what value means "Complete" in the 'Installed Mechanically' column
+DRILLDOWN_COMPLETE_VALUE = "Yes" # ASSUMING 'Yes' means installed. CHANGE IF NEEDED.
+
+# --- 5. File Uploader Widget ---
+st.sidebar.title("File Upload")
+uploaded_file = st.sidebar.file_uploader(
+    "Choose your Excel file",
+    type="xlsx",
+    help="Upload an Excel file with your event data."
+)
+
+# --- Helper Functions (Sections 6-13) ---
+
+# --- 6. Helper Function (Top-Level Donuts) ---
+def process_dataframe(df):
+    resource_col = COLUMN_MAPPINGS["resourceId"]
+    status_col = COLUMN_MAPPINGS["status"]
+    try:
+        status_complete_clean = STATUS_COMPLETE_VALUE.strip()
+        df[resource_col] = df[resource_col].fillna("Unassigned").astype(str).str.strip()
+        df[status_col] = df[status_col].fillna("Unknown Status").astype(str).str.strip()
+    except KeyError as e:
+        st.error(f"Config Error (Donuts): Column missing: {e}")
+        return None
+    df_agg = df.groupby([resource_col, status_col]).size().reset_index(name='count')
+    chart_data = []
+    for dept in df_agg[resource_col].unique():
+        dept_df = df_agg[df_agg[resource_col] == dept]
+        total_tasks = dept_df['count'].sum()
+        try:
+            tasks_complete = int(dept_df[dept_df[status_col] == status_complete_clean]['count'].sum())
+        except: tasks_complete = 0
+        tasks_incomplete = total_tasks - tasks_complete
+        if total_tasks > 0:
+            chart_data.append({"department": dept, "status": "Complete", "value": tasks_complete})
+            chart_data.append({"department": dept, "status": "Incomplete", "value": tasks_incomplete})
+    return pd.DataFrame(chart_data)
+
+# --- 7. Helper Function (Donut Chart Creation) ---
+def create_donut_chart(df_data, category_col='status', value_col='value', complete_label="Complete", incomplete_label="Incomplete"):
+    """Creates an Altair donut chart with percentage labels."""
+    color_scale = alt.Scale(domain=[complete_label, incomplete_label], range=["#81c784", "#e57373"])
+    base = alt.Chart(df_data).transform_joinaggregate(
+        total=f'sum({value_col})'
+    ).transform_calculate(
+        percent=f"datum.{value_col} / datum.total"
+    ).encode(theta=alt.Theta(f"{value_col}", stack=True))
+    pie = base.mark_arc(outerRadius=120, innerRadius=80).encode(
+        color=alt.Color(f"{category_col}", scale=color_scale, legend=None),
+        order=alt.Order(f"{category_col}", sort="descending"),
+        tooltip=[category_col, value_col, alt.Tooltip("percent:Q", format=".0%")]
+    )
+    text = base.mark_text(radius=140).encode(
+        text=alt.Text("percent:Q", format=".0%"),
+        order=alt.Order(f"{category_col}", sort="descending"),
+        color=alt.value("black")
+    )
+    chart = pie + text
+    return chart
+
+# --- 8. Helper Function (Gantt Chart Data) ---
+def process_gantt_data(df):
+    try:
+        gantt_df = df[[
+            COLUMN_MAPPINGS["gantt_task"], COLUMN_MAPPINGS["gantt_start"],
+            COLUMN_MAPPINGS["gantt_end"], COLUMN_MAPPINGS["resourceId"],
+            COLUMN_MAPPINGS["gantt_wbs"]
+        ]].copy()
+        gantt_df.rename(columns={
+            COLUMN_MAPPINGS["gantt_task"]: "Task", COLUMN_MAPPINGS["gantt_start"]: "Start",
+            COLUMN_MAPPINGS["gantt_end"]: "Finish", COLUMN_MAPPINGS["resourceId"]: "Resource",
+            COLUMN_MAPPINGS["gantt_wbs"]: "WBS"
+        }, inplace=True)
+        gantt_df.dropna(subset=["Task", "Start", "Finish"], inplace=True)
+        gantt_df["Start"] = pd.to_datetime(gantt_df["Start"])
+        gantt_df["Finish"] = pd.to_datetime(gantt_df["Finish"])
+        gantt_df["Resource"] = gantt_df["Resource"].fillna("Unassigned").astype(str).str.strip()
+        gantt_df["WBS"] = gantt_df["WBS"].fillna("0").astype(str)
+        return gantt_df.to_dict('records')
+    except KeyError as e:
+        st.error(f"Config Error (Gantt): Column missing: {e}")
+        return None
+    except Exception as e:
+        st.error(f"Error during Gantt data processing: {e}")
+        return None
+
+# --- 9. Helper Function (Milestone Data) ---
+def process_milestone_data(df):
+    try:
+        milestone_col = COLUMN_MAPPINGS["milestone"]
+        milestone_val = MILESTONE_VALUE.strip()
+        milestone_df = df[df[milestone_col].astype(str).str.strip() == milestone_val].copy()
+        if milestone_df.empty: return pd.DataFrame(columns=["Task", "Date", "Department"])
+        milestone_df = milestone_df[[
+            COLUMN_MAPPINGS["gantt_task"], COLUMN_MAPPINGS["gantt_start"],
+            COLUMN_MAPPINGS["resourceId"]
+        ]].rename(columns={
+            COLUMN_MAPPINGS["gantt_task"]: "Task", COLUMN_MAPPINGS["gantt_start"]: "Date",
+            COLUMN_MAPPINGS["resourceId"]: "Department"
+        })
+        milestone_df["Date"] = pd.to_datetime(milestone_df["Date"])
+        milestone_df["Department"] = milestone_df["Department"].fillna("Unassigned").astype(str).str.strip()
+        return milestone_df
+    except KeyError as e:
+        st.error(f"Config Error (Milestone): Column missing: {e}")
+        return None
+    # Add general exception handling
+    except Exception as e:
+        st.error(f"Error during Milestone processing: {e}")
+        return None
+
+# --- 10. Helper Function (Department Completion % Table) ---
+def process_completion_data(df):
+    try:
+        resource_col = COLUMN_MAPPINGS["resourceId"]
+        percent_col = COLUMN_MAPPINGS["percent_complete"]
+        df[resource_col] = df[resource_col].fillna("Unassigned").astype(str).str.strip()
+        df[percent_col] = pd.to_numeric(df[percent_col], errors='coerce').fillna(0)
+        if df[percent_col].max() > 1: df[percent_col] = df[percent_col] / 100
+        df_completion = df.groupby(resource_col)[percent_col].mean().reset_index()
+        df_completion.rename(columns={
+            resource_col: "Department", percent_col: "Avg. Completion %"
+        }, inplace=True)
+        df_completion.sort_values(by="Avg. Completion %", ascending=False, inplace=True)
+        return df_completion
+    except KeyError as e:
+        st.error(f"Config Error (Dept Completion %): Column missing: {e}")
+        return None
+    except Exception as e:
+        st.error(f"Error during Dept Completion % processing: {e}")
+        return None
+
+# --- 11. Helper Function (Blocked Table) ---
+def process_blocked_data(df):
+    try:
+        blocked_col = COLUMN_MAPPINGS["blocked_status"]
+        blocked_val = BLOCKED_VALUE.strip()
+        blocked_df = df[df[blocked_col].astype(str).str.strip() == blocked_val].copy()
+        if blocked_df.empty: return pd.DataFrame(columns=["Task", "Department"])
+        blocked_df = blocked_df[[
+            COLUMN_MAPPINGS["gantt_task"], COLUMN_MAPPINGS["resourceId"]
+        ]].rename(columns={
+            COLUMN_MAPPINGS["gantt_task"]: "Task", COLUMN_MAPPINGS["resourceId"]: "Department"
+        })
+        blocked_df["Department"] = blocked_df["Department"].fillna("Unassigned").astype(str).str.strip()
+        return blocked_df
+    except KeyError as e:
+        st.error(f"Config Error (Blocked Table): Column missing: {e}")
+        return None
+    except Exception as e:
+        st.error(f"Error during Blocked Task processing: {e}")
+        return None
+
+# --- 12. Helper Function (Drill-Down Donuts Data) ---
+def process_drilldown_data(df, selected_dept):
+    """
+    Processes data for the drill-down donuts based on Assembly Number
+    within the selected department. Status is based on 'Installed Mechanically'.
+    """
+    resource_col = COLUMN_MAPPINGS["resourceId"]
+    assy_col = COLUMN_MAPPINGS["common_key"] # Drilldown category is now Assy
+    drilldown_stat_col = COLUMN_MAPPINGS["drilldown_status"] # Status column
+
+    try:
+        drilldown_complete_clean = DRILLDOWN_COMPLETE_VALUE.strip()
+
+        # 1. Filter the main DataFrame for the selected department
+        dept_df = df[df[resource_col] == selected_dept].copy()
+
+        # 2. Clean the assembly and status columns within this subset
+        dept_df[assy_col] = dept_df[assy_col].fillna("Unknown Assy").astype(str).str.strip()
+        dept_df[drilldown_stat_col] = dept_df[drilldown_stat_col].fillna("Unknown Status").astype(str).str.strip()
+
+        # 3. Group by the Assembly number and the drilldown status, then count
+        df_agg = dept_df.groupby([assy_col, drilldown_stat_col]).size().reset_index(name='count')
+
+        # 4. Transform into Complete vs Incomplete for each Assembly number
+        drilldown_chart_data = {} # Dict keys will be Assembly Numbers
+        for current_assy_num in df_agg[assy_col].unique():
+            assy_df = df_agg[df_agg[assy_col] == current_assy_num]
+            total_items = assy_df['count'].sum()
+            try:
+                # Count 'Installed' based on drilldown_stat_col
+                items_complete = int(assy_df[assy_df[drilldown_stat_col] == drilldown_complete_clean]['count'].sum())
+            except:
+                items_complete = 0
+            items_incomplete = total_items - items_complete
+
+            if total_items > 0:
+                drilldown_chart_data[current_assy_num] = pd.DataFrame([
+                    {"status": "Installed", "value": items_complete},
+                    {"status": "Not Installed", "value": items_incomplete}
+                ])
+
+        return drilldown_chart_data
+
+    except KeyError as e:
+        st.error(f"Config Error (Drilldown): Column missing: {e}. Check Assy/Installed Mechanically mappings?")
+        return None
+    except Exception as e:
+        st.error(f"Error during Drilldown processing: {e}")
+        return None
+
+# --- 13. Helper Function (Assembly Avg % Table) ---
+def process_assy_avg_percent(df_assy): # Takes the Assy_Prog DataFrame
+    """
+    Calculates the average completion percentage based on the first 9 chars
+    of the assembly number FROM THE Assy_Prog SHEET.
+    """
+    try:
+        assy_col = COLUMN_MAPPINGS["assy_num"]
+        percent_col = COLUMN_MAPPINGS["assy_percent"]
+
+        # --- TEMPORARY DEBUG ---
+        # st.sidebar.write("Columns found in Assy_Prog sheet:", list(df_assy.columns))
+        # --- END DEBUG ---
+
+        df_clean = df_assy.copy()
+        df_clean[assy_col] = df_clean[assy_col].fillna("N/A").astype(str).str.strip()
+        df_clean[percent_col] = pd.to_numeric(df_clean[percent_col], errors='coerce').fillna(0)
+        if df_clean[percent_col].max() > 1:
+            df_clean[percent_col] = df_clean[percent_col] / 100
+
+        df_clean['BaseAssy'] = df_clean[assy_col].str[:9] # Use first 9 chars
+        df_avg = df_clean.groupby('BaseAssy')[percent_col].mean().reset_index()
+        df_avg.rename(columns={
+            'BaseAssy': 'Assembly (Base)', percent_col: 'Avg. % Complete'
+        }, inplace=True)
+        df_avg.sort_values(by='Assembly (Base)', inplace=True)
+        return df_avg
+
+    except KeyError as e:
+        st.error(f"Config Error (Assy Avg %): Column '{e}' not found in 'Assy_Prog'. Check mappings.")
+        return None
+    except Exception as e:
+        st.error(f"Error during Assembly Avg % processing: {e}")
+        return None
+
+# --- Initialize Session State ---
+if 'drilldown_dept' not in st.session_state:
+    st.session_state.drilldown_dept = None
+
+# --- Main App Logic ---
+if uploaded_file is not None:
+    try:
+        # --- Read and Merge Data ---
+        common_key = COLUMN_MAPPINGS["common_key"]
+        try:
+            df_prog = pd.read_excel(uploaded_file, sheet_name="Prog_Export")
+            df_dash = pd.read_excel(uploaded_file, sheet_name="Dash_Export")
+            df_assy_prog = pd.read_excel(uploaded_file, sheet_name="Assy_Prog") # Read the third sheet
+        except ValueError as e:
+            st.error(f"Error reading sheets. Ensure 'Prog_Export', 'Dash_Export', AND 'Assy_Prog' exist: {e}"); st.stop()
+        if common_key not in df_prog.columns or common_key not in df_dash.columns:
+             st.error(f"Merge Error: Column '{common_key}' not in 'Prog_Export' or 'Dash_Export'."); st.stop()
+        df = pd.merge(df_prog, df_dash, on=common_key, how="left", suffixes=('_prog', '_dash'))
+        st.sidebar.success("Sheets merged successfully!")
+
+        # --- Run ALL processing functions ---
+        chart_df = process_dataframe(df.copy())
+        gantt_data = process_gantt_data(df.copy())
+        milestone_df = process_milestone_data(df.copy())
+        completion_df = process_completion_data(df.copy())
+        blocked_df = process_blocked_data(df.copy())
+        assy_avg_df = process_assy_avg_percent(df_assy_prog.copy()) # Use the separate Assy_Prog df
+
+        selected_departments_filter = []
+        all_departments = []
+
+        # --- DEBUG: Check Session State Value ---
+        st.sidebar.write("Current Drilldown Dept:", st.session_state.get('drilldown_dept', 'None (Initial)'))
+
+        # --- Section 1: Milestone Timeline ---
+        if milestone_df is not None and not milestone_df.empty:
+            st.subheader("Project Milestone Timeline")
+            base = alt.Chart(milestone_df).encode(
+                x=alt.X('Date:T', title='Timeline', axis=alt.Axis(format="%Y-%m-%d")),
+                tooltip=['Task', 'Date', 'Department']
+            )
+            rule = base.mark_rule().encode(
+                 y=alt.Y('Department:N', title='Department', axis=None),
+                 color=alt.Color('Department:N', legend=None))
+            text = base.mark_text(align='left', baseline='middle', dx=7, size=10
+            ).encode(text='Task:N', y=alt.Y('Department:N', title='Department'), color=alt.value('black'))
+            milestone_chart = (rule + text).interactive()
+            st.altair_chart(milestone_chart, use_container_width=True); st.markdown("---")
+
+        # --- Section 2: Donut Charts (Conditional Display) ---
+        st.subheader("Department Status Dashboard")
+        if st.session_state.drilldown_dept is None:
+            # Main View
+            if chart_df is not None and not chart_df.empty:
+                all_departments = sorted(chart_df['department'].unique())
+                selected_departments_filter = st.multiselect("Filter Departments:", options=all_departments, default=all_departments)
+                st.markdown("---")
+                col1, col2, col3 = st.columns(3); cols = [col1, col2, col3]
+                for i, dept in enumerate(all_departments):
+                    with cols[i % 3]:
+                        st.markdown(f"**{dept}**")
+                        if dept in selected_departments_filter:
+                            df_dept = chart_df[chart_df['department'] == dept]
+                            if not df_dept.empty:
+                                chart = create_donut_chart(df_dept)
+                                st.altair_chart(chart, use_container_width=True)
+                            else: st.caption("No tasks.")
+                        else: st.caption("(Filtered out)")
+
+                        # DEBUG: Check state setting on click
+                        if st.button(f"Drill Down on {dept}", key=f"drill_{dept}"):
+                            st.session_state.drilldown_dept = dept
+                            st.sidebar.write(f"Button Clicked! Setting drilldown_dept to: {dept}") # Add this debug line
+                            st.rerun() # Use st.rerun()
+            st.markdown("---")
+        else:
+            # Drill-Down View
+            selected_dept = st.session_state.drilldown_dept
+            st.markdown(f"### Drilldown: {selected_dept} - Assembly Status")
+            if st.button("⬅️ Back to Main View"):
+                st.session_state.drilldown_dept = None
+                st.rerun() # Use st.rerun()
+
+            drilldown_chart_data = process_drilldown_data(df.copy(), selected_dept)
+            if drilldown_chart_data:
+                col1, col2, col3 = st.columns(3); cols = [col1, col2, col3]
+                assembly_numbers = sorted(drilldown_chart_data.keys())
+                for i, assy_num in enumerate(assembly_numbers):
+                    with cols[i % 3]:
+                        st.markdown(f"**{assy_num}**")
+                        assy_donut_df = drilldown_chart_data[assy_num]
+                        chart = create_donut_chart(assy_donut_df, category_col='status', value_col='value',
+                                                   complete_label="Installed", incomplete_label="Not Installed")
+                        st.altair_chart(chart, use_container_width=True)
+            else: st.warning(f"No assembly drilldown data for {selected_dept}.")
+            st.markdown("---")
+
+        # --- Section 3: Gantt Chart ---
+        if gantt_data is not None:
+            st.subheader("Project Gantt Chart")
+            wbs_level = st.slider("Select WBS Outline Level (1 = Highest, 5 = Max Detail)", 1, 5, 3)
+            st.markdown("---")
+            filtered_gantt_data = []
+            if not all_departments and chart_df is not None: all_departments = sorted(chart_df['department'].unique())
+            active_depts_for_gantt = selected_departments_filter if selected_departments_filter else all_departments
+            for task in gantt_data:
+                in_dept = task['Resource'] in active_depts_for_gantt
+                is_correct_level = task['WBS'].count('.') < wbs_level
+                if in_dept and is_correct_level: filtered_gantt_data.append(task)
+            if not filtered_gantt_data: st.warning("No Gantt tasks found for filters.")
+            else:
+                colors = {dept: f'rgb({hash(dept)%255}, {hash(dept*2)%255}, {hash(dept*3)%255})' for dept in active_depts_for_gantt}
+                num_tasks = len(filtered_gantt_data)
+                chart_height = max(400, min(2000, num_tasks * 30 + 150))
+                fig = ff.create_gantt(filtered_gantt_data, colors=colors, index_col='Resource',
+                                      group_tasks_by_resource=True, show_colorbar=False, showgrid_x=True, showgrid_y=True)
+                fig.update_layout(height=chart_height)
+                st.plotly_chart(fig, use_container_width=True)
+
+        # --- Section 4: Summary Tables ---
+        st.subheader("Summary Tables")
+        st.markdown("---")
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1: # Dept Completion %
+            st.write("#### Dept Completion (Avg. %)")
+            if completion_df is not None and not completion_df.empty:
+                st.dataframe(completion_df, column_config={"Avg. Completion %": st.column_config.ProgressColumn(
+                    "Avg. Completion %", help="Avg. of '% Complete' column.", format="%.0f%%", min_value=0, max_value=1)},
+                    use_container_width=True, hide_index=True, column_order=("Department", "Avg. Completion %"))
+            else: st.info("No data for completion %.")
+
+        with col2: # Milestones
+            st.write("#### Project Milestones")
+            if milestone_df is not None and not milestone_df.empty:
+                st.dataframe(milestone_df[['Task', 'Date', 'Department']], use_container_width=True, hide_index=True)
+            else: st.info("No milestones found.")
+
+        with col3: # Blocked Tasks
+            st.write("#### Blocked Tasks")
+            if blocked_df is not None and not blocked_df.empty:
+                st.dataframe(blocked_df[['Task', 'Department']], use_container_width=True, hide_index=True)
+            else: st.info("No blocked tasks found.")
+
+        with col4: # Assembly Average %
+            st.write("#### Assembly Avg. % Complete")
+            if assy_avg_df is not None and not assy_avg_df.empty:
+                 st.dataframe(
+                    assy_avg_df,
+                    column_config={"Avg. % Complete": st.column_config.ProgressColumn(
+                        "Avg. % Complete", help="Avg % Complete from Assy_Prog sheet.", format="%.0f%%", min_value=0, max_value=1)},
+                    use_container_width=True, hide_index=True, column_order=("Assembly (Base)", "Avg. % Complete"))
+            else: st.info("No data for Assembly average %.")
+
+    except Exception as e:
+        st.exception(e)
+
+# Message shown before file upload
+else:
+    st.info("Please upload your Excel file in the sidebar to begin.")
