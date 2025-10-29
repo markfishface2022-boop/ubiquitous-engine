@@ -46,7 +46,8 @@ COLUMN_MAPPINGS = {
 
     # --- Assy Avg % keys (From Assy_Prog sheet) ---
     "assy_num": "Assy", # Change if Assy number column has a different name in Assy_Prog
-    "assy_percent": "Assy % Complete" # Change to match the % column name in Assy_Prog
+    "assy_percent": "Assy % Complete", # Change to match the % column name in Assy_Prog
+    "t_assy_num": "T_Assy" # T_Assy column identifier *within the Assy_Prog sheet*
 }
 
 # --- 4. Status/Value Definitions (USER MUST EDIT THIS) ---
@@ -206,15 +207,51 @@ def process_blocked_data(df):
         st.error(f"Error during Blocked Task processing: {e}")
         return None
 
-# --- 12. Helper Function (Drill-Down Donuts Data) ---
-def process_drilldown_data(df, selected_dept):
+# --- 12. NEW: Helper Function (Get Top Assembly List) ---
+def get_top_assemblies(df_assy):
+    """
+    Reads the Assy_Prog DataFrame and returns a list of Assembly numbers
+    marked as Top Assemblies.
+    """
+    try:
+        assy_col = COLUMN_MAPPINGS["assy_num"]
+        t_assy_col = COLUMN_MAPPINGS["t_assy_num"]
+        target_t_assy_value = T_ASSY_FILTER_VALUE.strip()
+
+        # Clean the relevant columns
+        df_clean = df_assy.copy()
+        df_clean[assy_col] = df_clean[assy_col].fillna("N/A").astype(str).str.strip()
+        df_clean[t_assy_col] = df_clean[t_assy_col].fillna("Not Top Assy").astype(str).str.strip()
+
+        # Filter for top assemblies
+        top_assy_df = df_clean[df_clean[t_assy_col] == target_t_assy_value]
+
+        # Return the list of unique Assy numbers from the filtered data
+        return top_assy_df[assy_col].unique().tolist()
+
+    except KeyError as e:
+        st.error(f"Config Error (Top Assy List): Column missing from 'Assy_Prog': {e}.")
+        return [] # Return empty list on error
+    except Exception as e:
+        st.error(f"Error getting Top Assembly list: {e}")
+        return []
+
+# --- 13. Helper Function (Drill-Down Donuts Data) ---
+# UPDATED to use pre-filtered Top Assembly list
+def process_drilldown_data(df, selected_dept, top_assemblies_list): # Added new argument
     """
     Processes data for the drill-down donuts based on Assembly Number
-    within the selected department. Status is based on 'Installed Mechanically'.
+    within the selected department, showing ONLY assemblies from the top_assemblies_list.
+    Status is based on 'Installed Mechanically'.
     """
     resource_col = COLUMN_MAPPINGS["resourceId"]
-    assy_col = COLUMN_MAPPINGS["common_key"] # Drilldown category is now Assy
+    assy_col = COLUMN_MAPPINGS["common_key"] # Main Assy column from merged df
     drilldown_stat_col = COLUMN_MAPPINGS["drilldown_status"] # Status column
+
+    # Check if the list of top assemblies is empty
+    if not top_assemblies_list:
+         st.warning("No Top Assemblies identified from the 'Assy_Prog' sheet based on your filter.")
+         return {}
 
     try:
         drilldown_complete_clean = DRILLDOWN_COMPLETE_VALUE.strip()
@@ -226,16 +263,29 @@ def process_drilldown_data(df, selected_dept):
         dept_df[assy_col] = dept_df[assy_col].fillna("Unknown Assy").astype(str).str.strip()
         dept_df[drilldown_stat_col] = dept_df[drilldown_stat_col].fillna("Unknown Status").astype(str).str.strip()
 
-        # 3. Group by the Assembly number and the drilldown status, then count
-        df_agg = dept_df.groupby([assy_col, drilldown_stat_col]).size().reset_index(name='count')
+        # --- FILTER FOR TOP ASSEMBLIES (using the passed list) ---
+        # Keep only rows where the Assembly number is in our list
+        dept_df_filtered = dept_df[dept_df[assy_col].isin(top_assemblies_list)]
+        # --- END FILTER ---
 
-        # 4. Transform into Complete vs Incomplete for each Assembly number
-        drilldown_chart_data = {} # Dict keys will be Assembly Numbers
+        # Check if filtering resulted in an empty DataFrame for this dept
+        if dept_df_filtered.empty:
+            # Don't show an error, just means this dept has no top assys listed for it
+            # st.info(f"No Top Assembly tasks found for {selected_dept} in the main data.")
+            return {} # Return empty dictionary
+
+        # 3. Group the *filtered* data by Assembly number and drilldown status, then count
+        # Ensure we only group by columns present in dept_df_filtered
+        df_agg = dept_df_filtered.groupby([assy_col, drilldown_stat_col]).size().reset_index(name='count')
+
+
+        # 4. Transform into Complete vs Incomplete for each Top Assembly number
+        drilldown_chart_data = {} # Dict keys will be Top Assembly Numbers
+        # Loop through unique Assy numbers found AFTER filtering
         for current_assy_num in df_agg[assy_col].unique():
             assy_df = df_agg[df_agg[assy_col] == current_assy_num]
             total_items = assy_df['count'].sum()
             try:
-                # Count 'Installed' based on drilldown_stat_col
                 items_complete = int(assy_df[assy_df[drilldown_stat_col] == drilldown_complete_clean]['count'].sum())
             except:
                 items_complete = 0
@@ -250,13 +300,14 @@ def process_drilldown_data(df, selected_dept):
         return drilldown_chart_data
 
     except KeyError as e:
-        st.error(f"Config Error (Drilldown): Column missing: {e}. Check Assy/Installed Mechanically mappings?")
+        # This might catch errors if expected columns aren't in the merged df
+        st.error(f"Config Error (Drilldown Processing): Column missing: {e}.")
         return None
     except Exception as e:
         st.error(f"Error during Drilldown processing: {e}")
         return None
 
-# --- 13. Helper Function (Assembly Avg % Table) ---
+# --- 14. Helper Function (Assembly Avg % Table) ---
 def process_assy_avg_percent(df_assy): # Takes the Assy_Prog DataFrame
     """
     Calculates the average completion percentage based on the first 9 chars
@@ -318,6 +369,11 @@ if uploaded_file is not None:
         completion_df = process_completion_data(df.copy())
         blocked_df = process_blocked_data(df.copy())
         assy_avg_df = process_assy_avg_percent(df_assy_prog.copy()) # Use the separate Assy_Prog df
+        top_assemblies_list = get_top_assemblies(df_assy_prog.copy())
+        if not top_assemblies_list:
+            st.sidebar.warning("Could not identify any Top Assemblies from 'Assy_Prog' sheet based on filter.")
+        else:
+            st.sidebar.info(f"Identified {len(top_assemblies_list)} Top Assemblies to focus on.")
 
         selected_departments_filter = []
         all_departments = []
@@ -341,41 +397,21 @@ if uploaded_file is not None:
             st.altair_chart(milestone_chart, use_container_width=True); st.markdown("---")
 
         # --- Section 2: Donut Charts (Conditional Display) ---
-        st.subheader("Department Status Dashboard")
+     st.subheader("Department Status Dashboard")
         if st.session_state.drilldown_dept is None:
-            # Main View
-            if chart_df is not None and not chart_df.empty:
-                all_departments = sorted(chart_df['department'].unique())
-                selected_departments_filter = st.multiselect("Filter Departments:", options=all_departments, default=all_departments)
-                st.markdown("---")
-                col1, col2, col3 = st.columns(3); cols = [col1, col2, col3]
-                for i, dept in enumerate(all_departments):
-                    with cols[i % 3]:
-                        st.markdown(f"**{dept}**")
-                        if dept in selected_departments_filter:
-                            df_dept = chart_df[chart_df['department'] == dept]
-                            if not df_dept.empty:
-                                chart = create_donut_chart(df_dept)
-                                st.altair_chart(chart, use_container_width=True)
-                            else: st.caption("No tasks.")
-                        else: st.caption("(Filtered out)")
-
-                        # DEBUG: Check state setting on click
-                        if st.button(f"Drill Down on {dept}", key=f"drill_{dept}"):
-                            st.session_state.drilldown_dept = dept
-                            st.sidebar.write(f"Button Clicked! Setting drilldown_dept to: {dept}") # Add this debug line
-                            st.rerun() # Use st.rerun()
-            st.markdown("---")
+            # ... (Main View remains the same) ...
         else:
-            # Drill-Down View
+            # Drill-Down View (showing Filtered Assembly status)
             selected_dept = st.session_state.drilldown_dept
-            st.markdown(f"### Drilldown: {selected_dept} - Assembly Status")
+            st.markdown(f"### Drilldown: {selected_dept} - Top Assembly Status") # Updated title
             if st.button("⬅️ Back to Main View"):
                 st.session_state.drilldown_dept = None
-                st.rerun() # Use st.rerun()
+                st.rerun()
 
-            drilldown_chart_data = process_drilldown_data(df.copy(), selected_dept)
-            if drilldown_chart_data:
+            # --- UPDATED: Pass the top_assemblies_list ---
+            drilldown_chart_data = process_drilldown_data(df.copy(), selected_dept, top_assemblies_list)
+
+            if drilldown_chart_data: # Check if dictionary is not empty
                 col1, col2, col3 = st.columns(3); cols = [col1, col2, col3]
                 assembly_numbers = sorted(drilldown_chart_data.keys())
                 for i, assy_num in enumerate(assembly_numbers):
@@ -385,7 +421,8 @@ if uploaded_file is not None:
                         chart = create_donut_chart(assy_donut_df, category_col='status', value_col='value',
                                                    complete_label="Installed", incomplete_label="Not Installed")
                         st.altair_chart(chart, use_container_width=True)
-            else: st.warning(f"No assembly drilldown data for {selected_dept}.")
+            # If drilldown_chart_data is empty (due to T_Assy filter or no matching assys in dept)
+            else: st.warning(f"No Top Assembly drilldown data found for {selected_dept}.")
             st.markdown("---")
 
         # --- Section 3: Gantt Chart ---
